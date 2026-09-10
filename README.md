@@ -82,6 +82,7 @@ java `
   "-Dotel.javaagent.extensions=C:\path\to\otel-jfr-extension.jar" `
   "-Dotel.service.name=APP-12345 | Spring Boot | DEV" `
   "-Dotel.resource.attributes=deployment.environment.name=localhost,service.namespace=macbook-pro,service.version=0.0.1" `
+  "-Dotel.java.disabled.resource.providers=io.opentelemetry.instrumentation.resources.ProcessResourceProvider" `
   "-Dotel.instrumentation.jfr.enabled=true" `
   "-Dotel.exporter.otlp.protocol=http/protobuf" `
   "-Dotel.exporter.otlp.traces.endpoint=https://1234567890.otlp.example.com/v1/traces" `
@@ -90,6 +91,19 @@ java `
   "-Dotel.exporter.otlp.headers=Authorization=Bearer <token>" `
   "-jar" "test.jar"
 ```
+
+> **Redacting the launch command / secrets.** The line
+> `-Dotel.java.disabled.resource.providers=io.opentelemetry.instrumentation.resources.ProcessResourceProvider`
+> disables the OTel Java agent's `ProcessResourceProvider`, which otherwise
+> attaches `process.command_args` / `process.command_line` (your full JVM
+> invocation) as resource attributes on **every** span, metric, and profile —
+> leaking any endpoints or API keys passed as `-D` flags. This is an agent-side
+> resource provider, not part of this extension. To keep just the process
+> metadata but drop those two keys, use
+> `-Dotel.experimental.resource.disabled-keys=process.command_args,process.command_line`
+> instead. Either way, prefer passing secrets via env vars
+> (`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_ENDPOINT`) rather than the
+> command line, since CLI args are also visible via `ps` / `/proc/<pid>/cmdline`.
 
 ### Quick local smoke test (print telemetry to the console instead of a remote backend)
 
@@ -122,6 +136,7 @@ e.g. `OTEL_INSTRUMENTATION_JFR_ENABLED`).
 | `otel.instrumentation.jfr.enabled` | `false` | Master switch. Extension is inert unless `true`. |
 | `otel.instrumentation.jfr.profiling-level` | `standard` | Single volume dial: `full` / `standard` / `light` / `off`. See the table below. |
 | `otel.instrumentation.jfr.profile` | `false` | `false` = execution samples → trace spans; `true` = → OTLP profiles signal. |
+| `otel.instrumentation.jfr.stack-log` | `true` | Span mode only: also emit each sample's full stack as a log record correlated to its `jfr.stack.sample` span (shows under **Logs related to span**). Requires the logs pipeline. |
 | `otel.instrumentation.jfr.profiling-enabled` | `true` | Hard gate on execution samples, applied on top of the level (set `false` for metrics only). |
 | `otel.instrumentation.jfr.sampling-period-ms` | *(level's value)* | Explicit override of the level's execution-sample period. |
 | `otel.instrumentation.jfr.profile.flush-interval-ms` | `10000` | Profile-mode only: how often the aggregated profile is flushed/exported. |
@@ -171,6 +186,41 @@ falls back to it.
 > Note: with the generic `otel.exporter.otlp.endpoint`, the SDK auto-appends
 > `/v1/traces` etc. With the **per-signal** endpoints you must include the full
 > path yourself (`.../v1/traces`).
+
+## Stack as a span-correlated log (`stack-log`)
+
+In span mode (`profile=false`), the nested `jfr.<Class>.<method>:<line>` spans draw
+the flame chart. With `otel.instrumentation.jfr.stack-log=true` (the **default**),
+each sample *additionally* emits **one log record** carrying that sample's full
+call stack, correlated by `trace_id` + `span_id` to its `jfr.stack.sample` root
+span. In a trace viewer it appears under **"Logs related to span"** when you
+select that span — so you get both the flame chart *and* a copy-pasteable stack
+list, mirroring a JFR viewer's stack panel:
+
+```
+org/springframework/boot/loader/jar/JarURLConnection.connect:97
+org/springframework/boot/loader/jar/JarURLConnection.getInputStream:163
+...
+java/lang/Thread.run:840
+```
+
+Frames are top-of-stack first and formatted `pkg/Class.method:line` to match the
+JFR viewer. The record also carries `jfr.thread.name` and `jfr.stack.depth`.
+
+Notes:
+
+- **Logs pipeline required.** The record only ships if a logs exporter is
+  configured (e.g. an `otel.exporter.otlp.logs.endpoint`, or `otel.logs.exporter`
+  set to something other than `none`). The console smoke test above sets
+  `otel.logs.exporter=none`, so flip it to `logging` to see the stack log locally.
+- **Correlates to the JFR sample span, not your app's HTTP span.**
+  `jdk.ExecutionSample` carries no application span context, so the log attaches
+  to the extension's `jfr.stack.sample` span — not to the Tomcat `GET /` span.
+- **Volume.** One log per sample per active thread (≈50/s/thread at 20 ms
+  sampling). Set `otel.instrumentation.jfr.stack-log=false` to turn it off, or
+  pair it with `profiling-level=light` (50 ms) to reduce the rate.
+- **Span mode only.** In profile mode (`profile=true`) there are no spans to
+  correlate to, so this flag is a no-op.
 
 ## Profiles output mode (experimental)
 

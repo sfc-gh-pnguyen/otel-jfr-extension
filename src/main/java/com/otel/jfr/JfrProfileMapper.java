@@ -278,7 +278,16 @@ final class JfrProfileMapper {
   }
 
   private static String threadName(RecordedEvent event) {
-    RecordedThread thread = event.getThread();
+    // jdk.ExecutionSample stores the profiled thread in "sampledThread"; the
+    // generic getThread() reads "eventThread", which is null for samples
+    // (committed by the JVM sampler, not the sampled thread) -> "unknown".
+    RecordedThread thread = null;
+    if (event.hasField("sampledThread")) {
+      thread = event.getThread("sampledThread");
+    }
+    if (thread == null) {
+      thread = event.getThread();
+    }
     if (thread == null) {
       return "unknown";
     }

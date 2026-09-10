@@ -26,6 +26,10 @@ import java.util.Map;
  *       - false: execution samples -> trace spans (default)
  *       - true : execution samples -> OTLP profiles signal instead
  *   otel.instrumentation.jfr.profile.flush-interval-ms (long, default 10000)
+ *   otel.instrumentation.jfr.stack-log            (boolean, default true)
+ *       - span mode only: also emit each sample's full stack as a log record
+ *         correlated to its jfr.stack.sample span (shows under "Logs related
+ *         to span"). Requires the logs pipeline to be enabled.
  * </pre>
  *
  * <p>When {@code profile=true}, profiles are POSTed to (in precedence order):
@@ -48,6 +52,7 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
   static final String PROP_PROFILING_ENABLED = "otel.instrumentation.jfr.profiling-enabled";
   static final String PROP_PROFILE = "otel.instrumentation.jfr.profile";
   static final String PROP_FLUSH_INTERVAL_MS = "otel.instrumentation.jfr.profile.flush-interval-ms";
+  static final String PROP_STACK_LOG = "otel.instrumentation.jfr.stack-log";
 
   static final String PROP_OTLP_ENDPOINT = "otel.exporter.otlp.endpoint";
   static final String PROP_OTLP_PROFILES_ENDPOINT = "otel.exporter.otlp.profiles.endpoint";
@@ -78,6 +83,8 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
     final long flushIntervalMs;
     final String profilesEndpoint;
     final Map<String, String> profilesHeaders;
+    // span mode: also emit each sample's stack as a span-correlated log record
+    final boolean stackLogEnabled;
     // metric knobs (driven by profiling-level)
     final boolean metricsEnabled;
     final long metricsPeriodMs;
@@ -92,6 +99,7 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
         long flushIntervalMs,
         String profilesEndpoint,
         Map<String, String> profilesHeaders,
+        boolean stackLogEnabled,
         boolean metricsEnabled,
         long metricsPeriodMs,
         boolean perThreadMetricsEnabled,
@@ -103,6 +111,7 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
       this.flushIntervalMs = flushIntervalMs;
       this.profilesEndpoint = profilesEndpoint;
       this.profilesHeaders = profilesHeaders;
+      this.stackLogEnabled = stackLogEnabled;
       this.metricsEnabled = metricsEnabled;
       this.metricsPeriodMs = metricsPeriodMs;
       this.perThreadMetricsEnabled = perThreadMetricsEnabled;

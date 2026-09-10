@@ -53,6 +53,8 @@ public class JfrAgentListener implements AgentListener {
               && getBoolean(config, JfrExtensionProvider.PROP_PROFILING_ENABLED, true);
 
       boolean profileMode = getBoolean(config, JfrExtensionProvider.PROP_PROFILE, false);
+      // span mode only: default on so the stack shows under "Logs related to span".
+      boolean stackLogEnabled = getBoolean(config, JfrExtensionProvider.PROP_STACK_LOG, true);
       JfrSettings settings =
           new JfrSettings(
               executionSampleEnabled,
@@ -61,6 +63,7 @@ public class JfrAgentListener implements AgentListener {
               getLong(config, JfrExtensionProvider.PROP_FLUSH_INTERVAL_MS, 10000L),
               resolveProfilesEndpoint(config),
               resolveProfilesHeaders(config),
+              stackLogEnabled,
               level.metricsEnabled,
               level.metricsPeriodMs,
               level.perThreadMetricsEnabled,
@@ -76,6 +79,9 @@ public class JfrAgentListener implements AgentListener {
               + (executionSampleEnabled ? (profileMode ? "profile" : "span") : "off")
               + ", samplingPeriodMs="
               + settings.samplingPeriodMs
+              + (executionSampleEnabled && !profileMode
+                  ? ", stackLog=" + settings.stackLogEnabled
+                  : "")
               + (profileMode && executionSampleEnabled
                   ? ", profilesEndpoint=" + settings.profilesEndpoint
                   : "")

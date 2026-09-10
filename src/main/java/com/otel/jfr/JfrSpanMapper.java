@@ -2,6 +2,8 @@ package com.otel.jfr;
 
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.logs.Logger;
+import io.opentelemetry.api.logs.Severity;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.Tracer;
@@ -75,11 +77,40 @@ final class JfrSpanMapper {
 
   private final Tracer tracer;
 
+  /** When true, also emit each sample's stack as a span-correlated log record. */
+  private final boolean stackLogEnabled;
+
+  private final Logger stackLogger;
+
+  /** Diagnostic logger; reports the first stack-log emission failure, if any. */
+  private static final java.util.logging.Logger LOG =
+      java.util.logging.Logger.getLogger(JfrSpanMapper.class.getName());
+
+  /** Ensures a stack-log emission failure is reported at most once. */
+  private volatile boolean stackLogErrorReported = false;
+
   /** Per-thread timestamp of the previous sample, for real interval computation. */
   private final Map<String, Instant> lastSampleByThread = new ConcurrentHashMap<>();
 
-  JfrSpanMapper(OpenTelemetry openTelemetry) {
+  JfrSpanMapper(OpenTelemetry openTelemetry, boolean stackLogEnabled) {
     this.tracer = openTelemetry.getTracer("com.otel.jfr");
+    Logger lg = null;
+    boolean enabled = stackLogEnabled;
+    if (enabled) {
+      try {
+        lg = openTelemetry.getLogsBridge().get("com.otel.jfr");
+      } catch (RuntimeException | LinkageError t) {
+        // Never let the logs subsystem prevent span emission: degrade to spans-only.
+        enabled = false;
+        LOG.log(
+            java.util.logging.Level.WARNING,
+            "otel-jfr-extension: logs bridge unavailable; stack-log disabled,"
+                + " JFR spans unaffected",
+            t);
+      }
+    }
+    this.stackLogger = lg;
+    this.stackLogEnabled = enabled;
   }
 
   void onExecutionSample(RecordedEvent event) {
@@ -126,6 +157,26 @@ final class JfrSpanMapper {
       spans[i].end(end);
     }
     rootSpan.end(end);
+
+    // Emit the stack log LAST and defensively. Span export is the primary
+    // output; building/emitting the log must never leave the root span unended
+    // (that previously suppressed ALL JFR spans) or abort the child spans. Use a
+    // fresh root context -- parentContext was reassigned to the deepest child
+    // during nesting above, so it no longer points at the root span.
+    if (stackLogEnabled) {
+      try {
+        emitStackLog(frames, frameCount, Context.root().with(rootSpan), sampleTime, thread);
+      } catch (RuntimeException e) {
+        if (!stackLogErrorReported) {
+          stackLogErrorReported = true;
+          LOG.log(
+              java.util.logging.Level.WARNING,
+              "otel-jfr-extension: stack-log emission failed; JFR spans unaffected,"
+                  + " further failures suppressed",
+              e);
+        }
+      }
+    }
   }
 
   private Span spanForFrame(
@@ -143,9 +194,18 @@ final class JfrSpanMapper {
       }
     }
 
+    int line = frame.getLineNumber();
+
+    // Include the source line in the span name (e.g. jfr.Http11Processor.service:399)
+    // for parity with the JFR flamegraph, which labels frames by call site.
+    String spanName = "jfr." + className + "." + methodName;
+    if (line > 0) {
+      spanName = spanName + ":" + line;
+    }
+
     var builder =
         tracer
-            .spanBuilder("jfr." + className + "." + methodName)
+            .spanBuilder(spanName)
             .setSpanKind(SpanKind.INTERNAL)
             .setParent(parent)
             .setStartTimestamp(start)
@@ -155,7 +215,6 @@ final class JfrSpanMapper {
             .setAttribute(THREAD_NAME, thread)
             .setAttribute(SYNTHETIC_DURATION, true);
 
-    int line = frame.getLineNumber();
     if (line > 0) {
       builder.setAttribute(CODE_LINENO, (long) line);
     }
@@ -182,8 +241,67 @@ final class JfrSpanMapper {
     return gap.compareTo(MAX_INTERVAL) > 0 ? MAX_INTERVAL : gap;
   }
 
+  /**
+   * Emit the sample's stack as a single log record correlated (trace id + span
+   * id) to the {@code jfr.stack.sample} root span, so it appears under "Logs
+   * related to span". Frames are top-of-stack first and formatted like the JFR
+   * viewer's stack panel (e.g. {@code java/net/URLClassLoader$1.run:421}).
+   */
+  private void emitStackLog(
+      List<RecordedFrame> frames,
+      int frameCount,
+      Context spanContext,
+      Instant sampleTime,
+      String thread) {
+    StringBuilder body = new StringBuilder();
+    for (int i = 0; i < frameCount; i++) {
+      // Index 0 is innermost (current) frame -> top of the list, as the viewer shows it.
+      if (i > 0) {
+        body.append('\n');
+      }
+      body.append(frameLine(frames.get(i)));
+    }
+    stackLogger
+        .logRecordBuilder()
+        .setContext(spanContext)
+        .setTimestamp(sampleTime)
+        .setSeverity(Severity.INFO)
+        .setBody(body.toString())
+        .setAttribute(THREAD_NAME, thread)
+        .setAttribute(STACK_DEPTH, (long) frames.size())
+        .emit();
+  }
+
+  /** One JFR-viewer-style frame line, e.g. {@code java/net/URLClassLoader$1.run:421}. */
+  private static String frameLine(RecordedFrame frame) {
+    RecordedMethod method = frame.getMethod();
+    String className = "unknown";
+    String methodName = "unknown";
+    if (method != null) {
+      RecordedClass type = method.getType();
+      if (type != null && type.getName() != null) {
+        className = type.getName();
+      }
+      if (method.getName() != null) {
+        methodName = method.getName();
+      }
+    }
+    String qualified = className.replace('.', '/') + "." + methodName;
+    int lineNumber = frame.getLineNumber();
+    return lineNumber > 0 ? qualified + ":" + lineNumber : qualified;
+  }
+
   private static String threadName(RecordedEvent event) {
-    RecordedThread thread = event.getThread();
+    // jdk.ExecutionSample stores the profiled thread in "sampledThread"; the
+    // generic getThread() reads "eventThread", which is null for samples
+    // (committed by the JVM sampler, not the sampled thread) -> "unknown".
+    RecordedThread thread = null;
+    if (event.hasField("sampledThread")) {
+      thread = event.getThread("sampledThread");
+    }
+    if (thread == null) {
+      thread = event.getThread();
+    }
     if (thread == null) {
       return "unknown";
     }

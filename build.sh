@@ -40,7 +40,24 @@ PROTOBUF_VERSION="${PROTOBUF_VERSION:-4.34.0}"
 MAVEN_CENTRAL="https://repo1.maven.org/maven2"
 LIBS_DIR="libs"
 BUILD_DIR="build/classes"
-OUT_JAR="otel-jfr-extension.jar"
+
+# --- Versioning -----------------------------------------------------------
+# Base version (override with VERSION=x.y.z). Each successful build bumps a
+# zero-padded, monotonically increasing build number persisted in
+# .build-number, producing artifacts like otel-jfr-extension-0.0.1-001.jar.
+# A stable, unversioned otel-jfr-extension.jar copy is also written so the
+# -Dotel.javaagent.extensions=... path documented in the README stays valid.
+VERSION="${VERSION:-0.0.1}"
+ARTIFACT_BASE="otel-jfr-extension"
+BUILD_NUMBER_FILE=".build-number"
+
+prev_build="$([[ -f "${BUILD_NUMBER_FILE}" ]] && cat "${BUILD_NUMBER_FILE}" || echo 0)"
+BUILD_NUMBER="$((prev_build + 1))"
+BUILD_LABEL="$(printf '%03d' "${BUILD_NUMBER}")"
+FULL_VERSION="${VERSION}-${BUILD_LABEL}"
+
+OUT_JAR="${ARTIFACT_BASE}-${FULL_VERSION}.jar"
+STABLE_JAR="${ARTIFACT_BASE}.jar"
 
 COMPILE_ONLY_ARTIFACTS=(
   "io/opentelemetry/opentelemetry-api/${OTEL_VERSION}/opentelemetry-api-${OTEL_VERSION}.jar"
@@ -96,11 +113,25 @@ for path in "${BUNDLED_ARTIFACTS[@]}"; do
   unzip -o -q "${LIBS_DIR}/${jar_name}" -d "${BUILD_DIR}" -x "META-INF/*" "module-info.class" "**/module-info.class"
 done
 
-echo "==> Packaging ${OUT_JAR}"
+echo "==> Packaging ${OUT_JAR} (version ${FULL_VERSION})"
+MANIFEST="build/MANIFEST.MF"
+cat > "${MANIFEST}" <<EOF
+Manifest-Version: 1.0
+Implementation-Title: ${ARTIFACT_BASE}
+Implementation-Version: ${FULL_VERSION}
+EOF
+
 rm -f "${OUT_JAR}"
-jar --create --file "${OUT_JAR}" \
+jar --create --file "${OUT_JAR}" --manifest "${MANIFEST}" \
   -C "${BUILD_DIR}" . \
   -C src/main/resources .
 
+# Stable, unversioned copy so the README's -Dotel.javaagent.extensions path works.
+cp -f "${OUT_JAR}" "${STABLE_JAR}"
+
+# Only consume a build number on a fully successful build (set -e aborts earlier).
+echo "${BUILD_NUMBER}" > "${BUILD_NUMBER_FILE}"
+
 echo "==> Done: $(pwd)/${OUT_JAR}"
+echo "          $(pwd)/${STABLE_JAR} (stable copy)"
 echo "    $(unzip -l "${OUT_JAR}" | tail -1)"
