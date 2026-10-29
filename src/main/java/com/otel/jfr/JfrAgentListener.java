@@ -74,7 +74,11 @@ public class JfrAgentListener implements AgentListener {
               getLong(config, JfrExtensionProvider.PROP_LOCK_THRESHOLD_MS, 5L),
               getLong(config, JfrExtensionProvider.PROP_JIT_THRESHOLD_MS, 100L),
               getBoolean(config, JfrExtensionProvider.PROP_SYSTEM_PROPERTIES, false),
-              getBoolean(config, JfrExtensionProvider.PROP_STACK_SUMMARY, true));
+              getBoolean(config, JfrExtensionProvider.PROP_STACK_SUMMARY, true),
+              Math.max(0L, getLong(config, JfrExtensionProvider.PROP_SPAN_MAX_PER_SECOND, 1000L)),
+              getBoolean(config, JfrExtensionProvider.PROP_AGGREGATE, false),
+              getBoolean(config, JfrExtensionProvider.PROP_AGGREGATE_TRACES, true),
+              Math.max(0L, getLong(config, JfrExtensionProvider.PROP_AGGREGATE_MAX_TRACE_SPANS, 1000L)));
 
       logger.info(
           "otel-jfr-extension: enabled (level="
@@ -82,11 +86,17 @@ public class JfrAgentListener implements AgentListener {
               + ", metrics="
               + settings.metricsEnabled
               + ", executionSampleOutput="
-              + (executionSampleEnabled ? (profileMode ? "profile" : "span") : "off")
+              + (executionSampleEnabled
+                  ? (profileMode ? "profile" : settings.aggregateEnabled ? "aggregate" : "span")
+                  : "off")
               + ", samplingPeriodMs="
               + settings.samplingPeriodMs
               + (executionSampleEnabled && !profileMode
                   ? ", stackLog=" + settings.stackLogEnabled
+                  + (settings.aggregateEnabled
+                      ? ", aggregateTraces=" + settings.aggregateTracesEnabled
+                          + ", flushIntervalMs=" + settings.flushIntervalMs
+                      : ", spanMaxPerSecond=" + settings.spanMaxPerSecond)
                   : "")
               + (profileMode && executionSampleEnabled
                   ? ", profilesEndpoint=" + settings.profilesEndpoint

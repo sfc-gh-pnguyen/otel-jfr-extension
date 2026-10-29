@@ -65,6 +65,7 @@ final class JfrRecordingManager {
   private volatile JfrProfileMapper profileMapper;
   private volatile JfrProfileExporter profileExporter;
   private volatile JfrStackSummary stackSummary;
+  private volatile JfrFlameAggregator flameAggregator;
 
   JfrRecordingManager(OpenTelemetry openTelemetry, Resource protoResource, JfrSettings settings) {
     this.openTelemetry = openTelemetry;
@@ -74,19 +75,31 @@ final class JfrRecordingManager {
 
   void start() {
     boolean profileMode = settings.executionSampleEnabled && settings.profileMode;
-    boolean spanMode = settings.executionSampleEnabled && !settings.profileMode;
+    boolean aggregateMode =
+        settings.executionSampleEnabled && !settings.profileMode && settings.aggregateEnabled;
+    boolean spanMode = settings.executionSampleEnabled && !settings.profileMode && !aggregateMode;
 
     JfrMetricMapper metrics =
         settings.metricsEnabled
             ? new JfrMetricMapper(openTelemetry, settings.normalizeThreadNames)
             : null;
-    JfrSpanMapper spans = spanMode ? new JfrSpanMapper(openTelemetry, settings.stackLogEnabled) : null;
+    JfrSpanMapper spans = spanMode ? new JfrSpanMapper(openTelemetry, settings.stackLogEnabled, settings.spanMaxPerSecond) : null;
+    if (aggregateMode) {
+      flameAggregator =
+          new JfrFlameAggregator(
+              openTelemetry,
+              settings.normalizeThreadNames,
+              Math.max(settings.flushIntervalMs, 1000L),
+              settings.samplingPeriodMs,
+              settings.aggregateTracesEnabled,
+              settings.aggregateMaxTraceSpans);
+    }
     if (profileMode) {
       profileMapper = new JfrProfileMapper(settings.samplingPeriodMs, resource);
       profileExporter = new JfrProfileExporter(settings.profilesEndpoint, settings.profilesHeaders);
     }
 
-    if (!settings.metricsEnabled && !profileMode && !spanMode) {
+    if (!settings.metricsEnabled && !profileMode && !spanMode && !aggregateMode) {
       logger.info("otel-jfr-extension: profiling-level=off, nothing to collect");
       return;
     }
@@ -174,6 +187,7 @@ final class JfrRecordingManager {
     Consumer<RecordedEvent> sampleHandler =
         profileMode ? profileMapper::onExecutionSample
             : spanMode ? spans::onExecutionSample
+            : aggregateMode ? flameAggregator::onSample
             : null;
     if (sampleHandler != null && settings.stackSummaryEnabled) {
       JfrStackSummary summary =
@@ -199,7 +213,7 @@ final class JfrRecordingManager {
         rs.enable(EV_NATIVE_METHOD_SAMPLE).withPeriod(samplingPeriod).withStackTrace();
         rs.onEvent(EV_NATIVE_METHOD_SAMPLE, guard(EV_NATIVE_METHOD_SAMPLE, sampleHandler));
       }
-      if (profileMode || stackSummary != null) {
+      if (profileMode || aggregateMode || stackSummary != null) {
         startFlushLoop();
       }
     }
@@ -213,7 +227,7 @@ final class JfrRecordingManager {
         "otel-jfr-extension: JFR recording stream started (metrics="
             + settings.metricsEnabled
             + ", executionSample="
-            + (profileMode ? "profile" : spanMode ? "span" : "off")
+            + (profileMode ? "profile" : spanMode ? "span" : aggregateMode ? "aggregate" : "off")
             + ", nativeSamples="
             + (sampleHandler != null && settings.nativeSampleEnabled)
             + ", stackSummary="
@@ -261,6 +275,14 @@ final class JfrRecordingManager {
 
   private void flushAll() {
     flushProfiles();
+    JfrFlameAggregator agg = flameAggregator;
+    if (agg != null) {
+      try {
+        agg.flush();
+      } catch (RuntimeException | Error e) {
+        logger.log(Level.WARNING, "otel-jfr-extension: flame aggregate flush failed", e);
+      }
+    }
     JfrStackSummary summary = stackSummary;
     if (summary != null) {
       try {

@@ -88,7 +88,20 @@ final class JfrSpanMapper {
   /** Per-thread timestamp of the previous sample, for real interval computation. */
   private final Map<String, Instant> lastSampleByThread = new ConcurrentHashMap<>();
 
+  /** Max spans per second (0 = unlimited); bounds export volume so the SDK queue never overflows. */
+  private final long maxSpansPerSecond;
+
+  private final Object budgetLock = new Object();
+  private long budgetWindowStartMs = 0L;
+  private long spansInWindow = 0L;
+  private long droppedSamplesInWindow = 0L;
+
   JfrSpanMapper(OpenTelemetry openTelemetry, boolean stackLogEnabled) {
+    this(openTelemetry, stackLogEnabled, 0L);
+  }
+
+  JfrSpanMapper(OpenTelemetry openTelemetry, boolean stackLogEnabled, long maxSpansPerSecond) {
+    this.maxSpansPerSecond = maxSpansPerSecond;
     this.tracer = openTelemetry.getTracer("com.otel.jfr");
     Logger lg = null;
     boolean enabled = stackLogEnabled;
@@ -121,10 +134,17 @@ final class JfrSpanMapper {
 
     String thread = threadName(event);
     Instant sampleTime = event.getStartTime();
+    // Always advance the per-thread clock, even for samples dropped below.
     Instant end = sampleTime.plus(intervalFor(thread, sampleTime));
 
     // JFR returns frames innermost-first; reverse for caller -> callee nesting.
     int frameCount = Math.min(frames.size(), MAX_FRAMES);
+
+    // Whole-sample admission: a sample is either fully emitted or dropped, so
+    // the backend never receives a truncated flame trace.
+    if (!tryAcquire(frameCount + 1L)) {
+      return;
+    }
 
     Span rootSpan =
         tracer
@@ -219,6 +239,42 @@ final class JfrSpanMapper {
       builder.setAttribute(FRAME_TYPE, frameType);
     }
     return builder.startSpan();
+  }
+
+  /**
+   * Fixed one-second window budget. Returns false (and counts a drop) when
+   * emitting {@code cost} more spans would exceed {@link #maxSpansPerSecond}.
+   */
+  private boolean tryAcquire(long cost) {
+    if (maxSpansPerSecond <= 0) {
+      return true;
+    }
+    long droppedToReport = 0L;
+    boolean admitted;
+    synchronized (budgetLock) {
+      long now = System.currentTimeMillis();
+      if (now - budgetWindowStartMs >= 1000L) {
+        droppedToReport = droppedSamplesInWindow;
+        budgetWindowStartMs = now;
+        spansInWindow = 0L;
+        droppedSamplesInWindow = 0L;
+      }
+      admitted = spansInWindow + cost <= maxSpansPerSecond;
+      if (admitted) {
+        spansInWindow += cost;
+      } else {
+        droppedSamplesInWindow++;
+      }
+    }
+    if (droppedToReport > 0) {
+      LOG.fine(
+          "otel-jfr-extension: span budget ("
+              + maxSpansPerSecond
+              + "/s) skipped "
+              + droppedToReport
+              + " execution sample(s) in the last window");
+    }
+    return admitted;
   }
 
   /**

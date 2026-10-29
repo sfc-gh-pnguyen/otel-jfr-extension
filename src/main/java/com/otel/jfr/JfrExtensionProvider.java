@@ -73,6 +73,12 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
   static final String PROP_LOCK_THRESHOLD_MS = "otel.instrumentation.jfr.lock-threshold-ms";
   static final String PROP_JIT_THRESHOLD_MS = "otel.instrumentation.jfr.jit-threshold-ms";
   static final String PROP_SYSTEM_PROPERTIES = "otel.instrumentation.jfr.system-properties";
+  static final String PROP_AGGREGATE = "otel.instrumentation.jfr.aggregate";
+  static final String PROP_AGGREGATE_TRACES = "otel.instrumentation.jfr.aggregate.traces";
+  static final String PROP_AGGREGATE_MAX_TRACE_SPANS =
+      "otel.instrumentation.jfr.aggregate.max-trace-spans";
+  static final String PROP_SPAN_MAX_PER_SECOND =
+      "otel.instrumentation.jfr.span.max-per-second";
   static final String PROP_STACK_SUMMARY = "otel.instrumentation.jfr.stack-summary";
 
   static final String PROP_OTLP_ENDPOINT = "otel.exporter.otlp.endpoint";
@@ -119,6 +125,11 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
     final long jitThresholdMs;
     final boolean systemPropertiesEnabled;
     final boolean stackSummaryEnabled;
+    /** Span mode: max spans/sec from execution samples; 0 = unlimited. */
+    final long spanMaxPerSecond;
+    final boolean aggregateEnabled;
+    final boolean aggregateTracesEnabled;
+    final long aggregateMaxTraceSpans;
 
     JfrSettings(
         boolean executionSampleEnabled,
@@ -138,7 +149,11 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
         long lockThresholdMs,
         long jitThresholdMs,
         boolean systemPropertiesEnabled,
-        boolean stackSummaryEnabled) {
+        boolean stackSummaryEnabled,
+        long spanMaxPerSecond,
+        boolean aggregateEnabled,
+        boolean aggregateTracesEnabled,
+        long aggregateMaxTraceSpans) {
       this.executionSampleEnabled = executionSampleEnabled;
       this.samplingPeriodMs = samplingPeriodMs;
       this.profileMode = profileMode;
@@ -157,6 +172,10 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
       this.jitThresholdMs = jitThresholdMs;
       this.systemPropertiesEnabled = systemPropertiesEnabled;
       this.stackSummaryEnabled = stackSummaryEnabled;
+      this.spanMaxPerSecond = spanMaxPerSecond;
+      this.aggregateEnabled = aggregateEnabled;
+      this.aggregateTracesEnabled = aggregateTracesEnabled;
+      this.aggregateMaxTraceSpans = aggregateMaxTraceSpans;
     }
   }
 

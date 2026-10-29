@@ -137,6 +137,7 @@ e.g. `OTEL_INSTRUMENTATION_JFR_ENABLED`).
 | `otel.instrumentation.jfr.profiling-level` | `standard` | Single volume dial: `full` / `standard` / `light` / `off`. See the table below. |
 | `otel.instrumentation.jfr.profile` | `false` | `false` = execution samples → trace spans; `true` = → OTLP profiles signal. |
 | `otel.instrumentation.jfr.stack-log` | `true` | Span mode only: also emit each sample's full stack as a log record correlated to its `jfr.stack.sample` span (shows under **Logs related to span**). Requires the logs pipeline. |
+| `otel.instrumentation.jfr.span.max-per-second` | `1000` | Span mode only: caps spans emitted from execution samples per second (`0` = unlimited). Each sample costs 1 root + up to 64 frame spans; a sample that would exceed the budget is skipped whole (no truncated traces). See [Span volume and dropped spans](#span-volume-and-dropped-spans). |
 | `otel.instrumentation.jfr.profiling-enabled` | `true` | Hard gate on execution samples, applied on top of the level (set `false` for metrics only). |
 | `otel.instrumentation.jfr.sampling-period-ms` | *(level's value)* | Explicit override of the level's execution-sample period. |
 | `otel.instrumentation.jfr.profile.flush-interval-ms` | `10000` | Profile-mode only: how often the aggregated profile is flushed/exported. |
@@ -145,6 +146,9 @@ e.g. `OTEL_INSTRUMENTATION_JFR_ENABLED`).
 | `otel.instrumentation.jfr.lock-threshold-ms` | `5` | Minimum `jdk.JavaMonitorWait` / `jdk.JavaMonitorEnter` duration recorded. |
 | `otel.instrumentation.jfr.jit-threshold-ms` | `100` | Minimum `jdk.Compilation` duration recorded. |
 | `otel.instrumentation.jfr.system-properties` | `false` | Log initial system properties once (values of secret-looking keys redacted). |
+| `otel.instrumentation.jfr.aggregate` | `false` | **Aggregation mode.** Instead of one trace per execution sample, buffer samples per thread for each flush window (`profile.flush-interval-ms`, default 10s) and emit one merged, weighted call tree: `jfr.flame.node` log records (`thread \| frame \| parent_frame \| value`). Replaces span mode; ignored when `profile=true`. See [Aggregation mode](#aggregation-mode-aggregate). |
+| `otel.instrumentation.jfr.aggregate.traces` | `true` | Aggregate mode only: also emit one merged `jfr.flame: <thread>` trace per thread per window, span width proportional to sample count, so Trace Explorer's flame chart draws the aggregated flame graph. |
+| `otel.instrumentation.jfr.aggregate.max-trace-spans` | `1000` | Aggregate mode only: cap on merged-trace spans per flush window (heaviest branches first; the node logs are not capped by this). |
 | `otel.instrumentation.jfr.stack-summary` | `true` | Also aggregate execution samples into folded-stack log records (flame-graph input) and a `jfr.jvm.execution_sample.count` leaf-method counter, flushed every `profile.flush-interval-ms`. |
 
 ### Volume tiers — `profiling-level`
@@ -175,6 +179,40 @@ default when the property is omitted.
 `sampling-period-ms`, if set, overrides whatever period the level implies.
 `profiling-enabled=false` forces execution samples off regardless of level
 (metrics still follow the level).
+
+### Span volume and dropped spans
+
+In span mode every execution sample becomes **one root span + one span per
+frame (up to 64)**, plus one stack log when `stack-log=true`. At `full`
+(10ms sampling, native samples on) a busy app can generate thousands of spans
+per second — far more than the agent's `BatchSpanProcessor` queue (2048) can
+drain. Symptoms:
+
+```
+BatchSpanProcessor dropped 524 span(s) since the last export because the queue is full (maxQueueSize=2048)
+Failed to export 512 logs. The request could not be executed. java.io.InterruptedIOException: timeout
+```
+
+The log/metric timeouts follow because all signals share the same exporter
+connection that the span flood saturates (a `No route to host` in the cause is a
+network problem, not the extension).
+
+`span.max-per-second` (default `1000`) bounds this. If you still see drops,
+apply one or more, roughly in order of impact:
+
+| Fix | Flag |
+| --- | --- |
+| Lower the span budget | `-Dotel.instrumentation.jfr.span.max-per-second=300` |
+| Use a lower tier | `-Dotel.instrumentation.jfr.profiling-level=standard` (or `light`) |
+| Sample less often | `-Dotel.instrumentation.jfr.sampling-period-ms=50` |
+| Disable native samples | `-Dotel.instrumentation.jfr.native-samples=false` |
+| Drop the per-sample stack log | `-Dotel.instrumentation.jfr.stack-log=false` |
+| Switch to the profiles signal (aggregated, far smaller) | `-Dotel.instrumentation.jfr.profile=true` |
+| Give the SDK more headroom (native OTel) | `-Dotel.bsp.max.queue.size=8192 -Dotel.bsp.max.export.batch.size=2048 -Dotel.bsp.schedule.delay=1000` |
+| Allow slower backends more time (native OTel) | `-Dotel.exporter.otlp.timeout=30000` |
+
+The startup line reports the active budget, e.g.
+`otel-jfr-extension: enabled (level=full, ..., stackLog=true, spanMaxPerSecond=1000)`.
 
 ### Endpoint / protocol / header routing (native OTel — not this extension)
 
@@ -274,6 +312,83 @@ java `
 >   agent version, re-check its bundled protobuf version and pick a compatible
 >   `OTEL_PROTO_VERSION` (see `build.sh`), or profile export will fail at class
 >   init with a protobuf gencode/runtime mismatch.
+
+## Aggregation mode (`aggregate`)
+
+The default span output turns **every** `jdk.ExecutionSample` into its own
+trace (root + up to 64 frame spans). That is great for drilling into a single
+instant, but nothing is merged: building a flame graph means re-aggregating
+millions of spans in the backend, and the volume can overflow the SDK span
+queue (see [Span volume and dropped spans](#span-volume-and-dropped-spans)).
+
+Aggregation mode: samples are buffered per thread over a fixed window and
+merged into one **weighted call tree** before anything is emitted. Weight
+is a sample **count** (never a duration); node identity is the frame name 
+(`Class.method`) along the path from the root, so identical call paths
+merge into one node.
+
+```powershell
+-Dotel.instrumentation.jfr.aggregate=true `
+-Dotel.instrumentation.jfr.profile.flush-interval-ms=10000   # harvest window (default 10s)
+```
+
+```
+Sample 1: Thread.run > runWorker > OrderService.createOrder
+Sample 2: Thread.run > runWorker > OrderService.createOrder        ->  Thread.run        value=3
+Sample 3: Thread.run > runWorker > PricingService.calculate             runWorker       value=3
+                                                                          OrderService  value=2
+                                                                          PricingService value=1
+```
+
+Each window produces:
+
+1. **`jfr.flame.node` log records** - one per tree node, the exact
+   `thread | frame | parent_frame | value` table the flame-graph model needs,
+   plus `jfr.flame.path` (`root;...;frame`, the unambiguous node key),
+   `jfr.flame.depth`, `jfr.flame.self_value` (samples where this frame was the
+   on-CPU leaf) and `jfr.flame.thread_total`. Top-level frames have an empty
+   `parent_frame`. No OPAL re-aggregation is needed; summing `value` over
+   windows gives the tree for any time range.
+2. **One merged trace per thread** (`aggregate.traces=true`, default) - root
+   span `jfr.flame: <thread>`, child spans nested caller -> callee, children
+   laid out back-to-back heaviest first, each lasting
+   `value x sampling-period-ms`. Opened in Trace Explorer, its flame chart is
+   the aggregated flame graph for that thread and window. Spans carry
+   `jfr.aggregated=true`, `jfr.flame.value`, `jfr.flame.self_value` and
+   `jfr.synthetic_duration=true` - the widths are sample counts, **not**
+   latency. Capped by `aggregate.max-trace-spans` per window.
+
+Volume is bounded by the number of distinct call paths per window, not by the
+sampling rate or thread count, so it is typically far below span mode. At
+most 20,000 nodes are kept per window;
+once full, new paths stop growing and their samples count as self time of the
+deepest node already in the tree.
+
+`stack-summary` (folded stacks + leaf counter) still runs alongside if enabled.
+The per-sample span panels on the dashboard stay empty in this mode; use the
+**Aggregated Flame Graph** block instead (see [Dashboard](#dashboard)).
+
+## Dashboard
+
+`dashboards/java-flight-recorder.json` is the Observe dashboard;
+`java-flight-recorder-portable.json` / `.data` is a paste-ready copy that binds
+datasets by name (`OpenTelemetry Metrics`, `Tracing/Span`, `OpenTelemetry
+Logs`). Regenerate it with `python3 dashboards/make_portable.py`.
+
+`python3 dashboards/add_aggregate_cards.py` (idempotent) adds the
+**Aggregated Flame Graph** block, driven by `jfr.flame.node` logs: KPIs
+(samples, distinct frames, threads, max depth), a merged-call-tree waterfall,
+the raw `thread | frame | parent_frame | value` table, self time, total time,
+samples by thread, and the hottest caller -> callee edges. For a direct
+(non-portable) import, replace `OTEL_LOGS_DATASET_ID` with your tenant's logs
+dataset id.
+
+> **Rendering gap.** Observe's dashboard catalog has no flame/icicle widget;
+> the true flame-chart renderer only exists in Trace Explorer, bound to one
+> trace. The waterfall card approximates the shape (one bar per node, length =
+> sample count); the merged `jfr.flame: <thread>` traces are the closest thing
+> to a real aggregated flame graph today. A dashboard flame widget that accepts
+> a `frame | parent_frame | value` table remains an Observe product ask.
 
 ## How it works
 
@@ -379,6 +494,14 @@ named `jfr.stack.sample: <thread>`, child spans named `jfr.<Class>.<method>` wit
 > The sampled thread is exposed as `jfr.thread.name`, not the standard
 > `thread.name` -- the agent auto-stamps `thread.name` with the JFR dispatch
 > thread, which would otherwise hide the thread that was actually sampled.
+
+**Flame nodes** (`aggregate=true`) - one log record per call-tree node per
+flush window with `event.name=jfr.flame.node`, body = `jfr.flame.path`, and
+`jfr.thread.name`, `jfr.sample.type`, `jfr.flame.frame`,
+`jfr.flame.parent_frame`, `jfr.flame.path`, `jfr.flame.depth` (0 = outermost),
+`jfr.flame.value`, `jfr.flame.self_value`, `jfr.flame.thread_total`,
+`jfr.interval.ms`. Plus, with `aggregate.traces=true`, one `jfr.flame: <thread>`
+trace per thread per window (`jfr.aggregated=true`).
 
 **Profiles** (profile mode) - function/symbol names are **not** prefixed: the
 profiles signal is emitted only by this extension (the agent produces none), so
