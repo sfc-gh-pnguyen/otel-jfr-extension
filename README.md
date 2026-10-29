@@ -140,6 +140,12 @@ e.g. `OTEL_INSTRUMENTATION_JFR_ENABLED`).
 | `otel.instrumentation.jfr.profiling-enabled` | `true` | Hard gate on execution samples, applied on top of the level (set `false` for metrics only). |
 | `otel.instrumentation.jfr.sampling-period-ms` | *(level's value)* | Explicit override of the level's execution-sample period. |
 | `otel.instrumentation.jfr.profile.flush-interval-ms` | `10000` | Profile-mode only: how often the aggregated profile is flushed/exported. |
+| `otel.instrumentation.jfr.native-samples` | *(on for `full` only)* | Also sample threads running native code (`jdk.NativeMethodSample`) into the same span/profile output. |
+| `otel.instrumentation.jfr.thread-name-normalize` | `true` | Collapse variable thread names on metrics (`pool-3-thread-17` → `pool#thread#`) to bound cardinality. |
+| `otel.instrumentation.jfr.lock-threshold-ms` | `5` | Minimum `jdk.JavaMonitorWait` / `jdk.JavaMonitorEnter` duration recorded. |
+| `otel.instrumentation.jfr.jit-threshold-ms` | `100` | Minimum `jdk.Compilation` duration recorded. |
+| `otel.instrumentation.jfr.system-properties` | `false` | Log initial system properties once (values of secret-looking keys redacted). |
+| `otel.instrumentation.jfr.stack-summary` | `true` | Also aggregate execution samples into folded-stack log records (flame-graph input) and a `jfr.jvm.execution_sample.count` leaf-method counter, flushed every `profile.flush-interval-ms`. |
 
 ### Volume tiers — `profiling-level`
 
@@ -152,7 +158,8 @@ default when the property is omitted.
 | Metric period | 1s | 2s | 5s | — |
 | Per-thread metrics (ThreadCPULoad, ThreadAllocationStatistics) | on | on | **off** | off |
 | Allocation events (TLAB — highest volume) | on | **off** | off | off |
-| Socket read events | on | on | **off** | off |
+| Socket read/write events | on | on | **off** | off |
+| Native method samples | on | **off** | off | off |
 | Execution samples (spans/profiles) | on | on | on | off |
 | Sampling period | 10ms | 20ms | 50ms | — |
 
@@ -319,10 +326,46 @@ JVM dashboards, drop the `jfr.` prefix in `JfrMetricMapper`.)
 | `jfr.jvm.thread.context_switch.rate` | `{switch}/s` | `jdk.ThreadContextSwitchRate` |
 | `jfr.jvm.thread.memory.allocated` | `By` | `jdk.ThreadAllocationStatistics` |
 | `jfr.jvm.memory.used` / `jfr.jvm.memory.committed` / `jfr.jvm.memory.limit` | `By` | `jdk.GCHeapSummary`, `jdk.MetaspaceSummary` |
-| `jfr.jvm.gc.duration` | `s` | `jdk.GarbageCollection`, `jdk.G1GarbageCollection` |
+| `jfr.jvm.gc.duration` (`jvm.gc.generation=minor\|major` on `jdk.GarbageCollection`) | `s` | `jdk.GarbageCollection`, `jdk.G1GarbageCollection` |
+| `jfr.jvm.gc.heap_transition.duration` | `s` | `jdk.GCHeapSummary` (Before/After GC pair) |
+| `jfr.jvm.gc.allocation_requiring_gc.size` | `By` | `jdk.AllocationRequiringGC` |
 | `jfr.jvm.gc.longest_pause` | `s` | `jdk.GarbageCollection` |
 | `jfr.jvm.memory.allocation` (`jvm.jfr.allocation.location=in_new_tlab\|outside_tlab`) | `By` | `jdk.ObjectAllocationInNewTLAB`, `jdk.ObjectAllocationOutsideTLAB` |
 | `jfr.jvm.socket.read.bytes` / `jfr.jvm.socket.read.duration` | `By` / `s` | `jdk.SocketRead` |
+| `jfr.jvm.socket.write.bytes` / `jfr.jvm.socket.write.duration` | `By` / `s` | `jdk.SocketWrite` |
+| `jfr.jvm.monitor.wait.duration` (`jvm.jfr.monitor.class`, `jvm.jfr.monitor.timed_out`) | `s` | `jdk.JavaMonitorWait` |
+| `jfr.jvm.monitor.enter.duration` (`jvm.jfr.monitor.class`) | `s` | `jdk.JavaMonitorEnter` |
+| `jfr.jvm.jit.compilation.duration` (`jvm.jit.compiler`, `jvm.jit.compile_level`, `jvm.jit.succeeded`) | `s` | `jdk.Compilation` |
+| `jfr.jvm.sync_on_value_based_class` (`jvm.jfr.value_based_class`) | `{event}` | `jdk.SyncOnValueBasedClass` (JDK 16+) |
+| `jfr.jvm.gc.pause.time` (`jvm.gc.name`, `jvm.gc.generation`) | `s` | `jdk.GarbageCollection` (monotonic total) |
+| `jfr.jvm.jit.compilation.time` (`jvm.jit.compiler`) | `s` | `jdk.Compilation` (monotonic total) |
+| `jfr.jvm.execution_sample.count` (`code.function` = leaf method, capped at 200 then `other`; `jfr.thread.name`; `jfr.sample.type=java\|native`) | `{sample}` | `jdk.ExecutionSample`, `jdk.NativeMethodSample` |
+
+Duration histograms use second-scaled bucket boundaries (0.1 ms … 10 s) and byte
+histograms use 64 B … 256 MB boundaries, so percentiles are meaningful.
+
+> **Temporality.** Counters and histograms export as cumulative by default (OTel
+> SDK default), so per-interval charts must take deltas. Add
+> `-Dotel.exporter.otlp.metrics.temporality.preference=delta` to export
+> per-interval values instead. Don't switch an existing dashboard's data source
+> mid-stream: delta and cumulative points need different queries.
+
+Per-thread metrics carry `thread.name`, normalized by default (see
+`thread-name-normalize`).
+
+**Logs** - one `event.name=jfr.jvm.information` record per JVM (JVM name,
+version, start time, pid; command-line arguments are deliberately omitted since
+`-D` flags carry secrets), plus `event.name=jfr.jvm.system_property` records
+when `system-properties=true`.
+
+**Folded stacks** (`stack-summary=true`, default) - one log record per distinct
+stack per flush interval with `event.name=jfr.stack.summary`, body and
+`jfr.stack.folded` = `outer;...;leaf` (`Class.method` frames, max 64),
+`jfr.stack.leaf`, `jfr.stack.root`, `jfr.stack.depth`, `jfr.sample.count`,
+`jfr.thread.name`, `jfr.sample.type`. Sum `jfr.sample.count` grouped by
+`jfr.stack.folded` for a flame graph / top call paths, or by `jfr.stack.leaf`
+for self time. At most 5000 distinct stacks per interval; overflow is counted
+under `[truncated]`.
 
 **Spans** - from `jdk.ExecutionSample`: one trace per stack sample, root span
 named `jfr.stack.sample: <thread>`, child spans named `jfr.<Class>.<method>` with

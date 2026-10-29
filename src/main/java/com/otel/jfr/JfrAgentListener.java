@@ -68,7 +68,13 @@ public class JfrAgentListener implements AgentListener {
               level.metricsPeriodMs,
               level.perThreadMetricsEnabled,
               level.allocationEnabled,
-              level.socketEnabled);
+              level.socketEnabled,
+              getBoolean(config, JfrExtensionProvider.PROP_NATIVE_SAMPLES, level.nativeSampleEnabled),
+              getBoolean(config, JfrExtensionProvider.PROP_THREAD_NAME_NORMALIZE, true),
+              getLong(config, JfrExtensionProvider.PROP_LOCK_THRESHOLD_MS, 5L),
+              getLong(config, JfrExtensionProvider.PROP_JIT_THRESHOLD_MS, 100L),
+              getBoolean(config, JfrExtensionProvider.PROP_SYSTEM_PROPERTIES, false),
+              getBoolean(config, JfrExtensionProvider.PROP_STACK_SUMMARY, true));
 
       logger.info(
           "otel-jfr-extension: enabled (level="

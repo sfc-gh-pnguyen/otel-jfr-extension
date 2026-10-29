@@ -24,11 +24,7 @@ import jdk.jfr.consumer.RecordedThread;
  * Converts {@code jdk.ExecutionSample} stack samples into OTLP spans that render
  * as a flame/waterfall in a trace viewer.
  *
- * <p>This is materially more accurate than the repo's Python {@code jfr.py}
- * equivalent. That converter only ever saw New Relic's already-merged
- * {@code JfrFlameLevel} output, so it had to reconstruct a call tree from
- * parent-name references and invent span widths via an icicle layout. Here we
- * read the raw JDK event, which gives us:
+ * <p>It reads the raw JDK event, which gives us:
  *
  * <ul>
  *   <li>a real per-sample timestamp ({@link RecordedEvent#getStartTime()}),

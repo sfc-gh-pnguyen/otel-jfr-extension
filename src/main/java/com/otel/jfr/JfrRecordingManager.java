@@ -40,7 +40,18 @@ final class JfrRecordingManager {
   private static final String EV_ALLOC_IN_NEW_TLAB = "jdk.ObjectAllocationInNewTLAB";
   private static final String EV_ALLOC_OUTSIDE_TLAB = "jdk.ObjectAllocationOutsideTLAB";
   private static final String EV_SOCKET_READ = "jdk.SocketRead";
+  private static final String EV_SOCKET_WRITE = "jdk.SocketWrite";
+  private static final String EV_ALLOC_REQUIRING_GC = "jdk.AllocationRequiringGC";
+  private static final String EV_MONITOR_WAIT = "jdk.JavaMonitorWait";
+  private static final String EV_MONITOR_ENTER = "jdk.JavaMonitorEnter";
+  private static final String EV_COMPILATION = "jdk.Compilation";
+  private static final String EV_SYNC_ON_VBC = "jdk.SyncOnValueBasedClass";
+  // Pre-release JDK 16 name for the same event.
+  private static final String EV_SYNC_ON_PRIMITIVE_WRAPPER = "jdk.SyncOnPrimitiveWrapper";
+  private static final String EV_JVM_INFORMATION = "jdk.JVMInformation";
+  private static final String EV_INITIAL_SYSTEM_PROPERTY = "jdk.InitialSystemProperty";
   private static final String EV_EXECUTION_SAMPLE = "jdk.ExecutionSample";
+  private static final String EV_NATIVE_METHOD_SAMPLE = "jdk.NativeMethodSample";
 
   private final OpenTelemetry openTelemetry;
   private final Resource resource;
@@ -53,6 +64,7 @@ final class JfrRecordingManager {
   private volatile ScheduledExecutorService flushExecutor;
   private volatile JfrProfileMapper profileMapper;
   private volatile JfrProfileExporter profileExporter;
+  private volatile JfrStackSummary stackSummary;
 
   JfrRecordingManager(OpenTelemetry openTelemetry, Resource protoResource, JfrSettings settings) {
     this.openTelemetry = openTelemetry;
@@ -64,7 +76,10 @@ final class JfrRecordingManager {
     boolean profileMode = settings.executionSampleEnabled && settings.profileMode;
     boolean spanMode = settings.executionSampleEnabled && !settings.profileMode;
 
-    JfrMetricMapper metrics = settings.metricsEnabled ? new JfrMetricMapper(openTelemetry) : null;
+    JfrMetricMapper metrics =
+        settings.metricsEnabled
+            ? new JfrMetricMapper(openTelemetry, settings.normalizeThreadNames)
+            : null;
     JfrSpanMapper spans = spanMode ? new JfrSpanMapper(openTelemetry, settings.stackLogEnabled) : null;
     if (profileMode) {
       profileMapper = new JfrProfileMapper(settings.samplingPeriodMs, resource);
@@ -95,6 +110,39 @@ final class JfrRecordingManager {
       rs.onEvent(EV_GARBAGE_COLLECTION, guard(EV_GARBAGE_COLLECTION, metrics::onGarbageCollection));
       rs.onEvent(EV_G1_GARBAGE_COLLECTION, guard(EV_G1_GARBAGE_COLLECTION, metrics::onG1GarbageCollection));
 
+      // Low-volume GC trigger events.
+      rs.enable(EV_ALLOC_REQUIRING_GC);
+      rs.onEvent(EV_ALLOC_REQUIRING_GC, guard(EV_ALLOC_REQUIRING_GC, metrics::onAllocationRequiringGc));
+
+      // Lock contention and JIT: thresholded so only slow events are recorded.
+      Duration lockThreshold = Duration.ofMillis(Math.max(settings.lockThresholdMs, 0L));
+      rs.enable(EV_MONITOR_WAIT).withThreshold(lockThreshold);
+      rs.enable(EV_MONITOR_ENTER).withThreshold(lockThreshold);
+      rs.onEvent(EV_MONITOR_WAIT, guard(EV_MONITOR_WAIT, metrics::onMonitorWait));
+      rs.onEvent(EV_MONITOR_ENTER, guard(EV_MONITOR_ENTER, metrics::onMonitorEnter));
+      rs.enable(EV_COMPILATION)
+          .withThreshold(Duration.ofMillis(Math.max(settings.jitThresholdMs, 0L)));
+      rs.onEvent(EV_COMPILATION, guard(EV_COMPILATION, metrics::onCompilation));
+
+      // Only exists on JDK 16+; enabling an unknown event name is a no-op.
+      rs.enable(EV_SYNC_ON_VBC);
+      rs.enable(EV_SYNC_ON_PRIMITIVE_WRAPPER);
+      rs.onEvent(EV_SYNC_ON_VBC, guard(EV_SYNC_ON_VBC, metrics::onSyncOnValueBasedClass));
+      rs.onEvent(
+          EV_SYNC_ON_PRIMITIVE_WRAPPER,
+          guard(EV_SYNC_ON_PRIMITIVE_WRAPPER, metrics::onSyncOnValueBasedClass));
+
+      // One-shot JVM context as log records.
+      JfrJvmInfoMapper jvmInfo = new JfrJvmInfoMapper(openTelemetry);
+      rs.enable(EV_JVM_INFORMATION);
+      rs.onEvent(EV_JVM_INFORMATION, guard(EV_JVM_INFORMATION, jvmInfo::onJvmInformation));
+      if (settings.systemPropertiesEnabled) {
+        rs.enable(EV_INITIAL_SYSTEM_PROPERTY);
+        rs.onEvent(
+            EV_INITIAL_SYSTEM_PROPERTY,
+            guard(EV_INITIAL_SYSTEM_PROPERTY, jvmInfo::onInitialSystemProperty));
+      }
+
       // Per-thread metrics: high cardinality in thread-per-request apps.
       if (settings.perThreadMetricsEnabled) {
         rs.enable(EV_THREAD_CPU_LOAD).withPeriod(metricsPeriod);
@@ -111,25 +159,49 @@ final class JfrRecordingManager {
         rs.onEvent(EV_ALLOC_OUTSIDE_TLAB, guard(EV_ALLOC_OUTSIDE_TLAB, metrics::onAllocationOutsideTlab));
       }
 
-      // Socket reads: high volume in I/O-heavy apps.
+      // Socket I/O: high volume in I/O-heavy apps.
       if (settings.socketEnabled) {
         rs.enable(EV_SOCKET_READ).withoutThreshold();
         rs.onEvent(EV_SOCKET_READ, guard(EV_SOCKET_READ, metrics::onSocketRead));
+        rs.enable(EV_SOCKET_WRITE).withoutThreshold();
+        rs.onEvent(EV_SOCKET_WRITE, guard(EV_SOCKET_WRITE, metrics::onSocketWrite));
       }
     }
 
     // ---- execution samples -> spans or profiles ----
-    if (profileMode) {
-      rs.enable(EV_EXECUTION_SAMPLE)
-          .withPeriod(Duration.ofMillis(settings.samplingPeriodMs))
-          .withStackTrace();
-      rs.onEvent(EV_EXECUTION_SAMPLE, guard(EV_EXECUTION_SAMPLE, profileMapper::onExecutionSample));
-      startFlushLoop();
-    } else if (spanMode) {
-      rs.enable(EV_EXECUTION_SAMPLE)
-          .withPeriod(Duration.ofMillis(settings.samplingPeriodMs))
-          .withStackTrace();
-      rs.onEvent(EV_EXECUTION_SAMPLE, guard(EV_EXECUTION_SAMPLE, spans::onExecutionSample));
+    // jdk.NativeMethodSample has the same shape (sampledThread + stackTrace), so
+    // it reuses the execution-sample handler of whichever output mode is active.
+    Consumer<RecordedEvent> sampleHandler =
+        profileMode ? profileMapper::onExecutionSample
+            : spanMode ? spans::onExecutionSample
+            : null;
+    if (sampleHandler != null && settings.stackSummaryEnabled) {
+      JfrStackSummary summary =
+          new JfrStackSummary(
+              openTelemetry,
+              settings.normalizeThreadNames,
+              Math.max(settings.flushIntervalMs, 1000L));
+      stackSummary = summary;
+      Consumer<RecordedEvent> primary = sampleHandler;
+      // Summary failures must not suppress the primary span/profile output.
+      Consumer<RecordedEvent> guardedSummary = guard("jfr.stack.summary", summary::onSample);
+      sampleHandler =
+          event -> {
+            primary.accept(event);
+            guardedSummary.accept(event);
+          };
+    }
+    if (sampleHandler != null) {
+      Duration samplingPeriod = Duration.ofMillis(settings.samplingPeriodMs);
+      rs.enable(EV_EXECUTION_SAMPLE).withPeriod(samplingPeriod).withStackTrace();
+      rs.onEvent(EV_EXECUTION_SAMPLE, guard(EV_EXECUTION_SAMPLE, sampleHandler));
+      if (settings.nativeSampleEnabled) {
+        rs.enable(EV_NATIVE_METHOD_SAMPLE).withPeriod(samplingPeriod).withStackTrace();
+        rs.onEvent(EV_NATIVE_METHOD_SAMPLE, guard(EV_NATIVE_METHOD_SAMPLE, sampleHandler));
+      }
+      if (profileMode || stackSummary != null) {
+        startFlushLoop();
+      }
     }
 
     rs.setReuse(false);
@@ -142,6 +214,10 @@ final class JfrRecordingManager {
             + settings.metricsEnabled
             + ", executionSample="
             + (profileMode ? "profile" : spanMode ? "span" : "off")
+            + ", nativeSamples="
+            + (sampleHandler != null && settings.nativeSampleEnabled)
+            + ", stackSummary="
+            + (stackSummary != null)
             + ")");
   }
 
@@ -178,9 +254,21 @@ final class JfrRecordingManager {
             });
     long interval = Math.max(settings.flushIntervalMs, 1000L);
     flushExecutor.scheduleAtFixedRate(
-        this::flushProfiles, interval, interval, TimeUnit.MILLISECONDS);
-    logger.info("otel-jfr-extension: profile flush every " + interval + "ms -> "
-        + settings.profilesEndpoint);
+        this::flushAll, interval, interval, TimeUnit.MILLISECONDS);
+    logger.info("otel-jfr-extension: sample flush every " + interval + "ms"
+        + (profileExporter != null ? " -> " + settings.profilesEndpoint : ""));
+  }
+
+  private void flushAll() {
+    flushProfiles();
+    JfrStackSummary summary = stackSummary;
+    if (summary != null) {
+      try {
+        summary.flush();
+      } catch (RuntimeException | Error e) {
+        logger.log(Level.WARNING, "otel-jfr-extension: stack summary flush failed", e);
+      }
+    }
   }
 
   private void flushProfiles() {
@@ -202,7 +290,7 @@ final class JfrRecordingManager {
   void stop() {
     ScheduledExecutorService exec = this.flushExecutor;
     if (exec != null) {
-      flushProfiles(); // final drain
+      flushAll(); // final drain
       exec.shutdown();
     }
     RecordingStream rs = this.stream;

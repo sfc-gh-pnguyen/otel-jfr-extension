@@ -30,6 +30,20 @@ import java.util.Map;
  *       - span mode only: also emit each sample's full stack as a log record
  *         correlated to its jfr.stack.sample span (shows under "Logs related
  *         to span"). Requires the logs pipeline to be enabled.
+ *   otel.instrumentation.jfr.native-samples       (boolean; default on for level=full only)
+ *       - also sample threads running native code (jdk.NativeMethodSample)
+ *   otel.instrumentation.jfr.thread-name-normalize (boolean, default true)
+ *       - collapse pool-3-thread-17 style names to pool#thread# on metrics
+ *   otel.instrumentation.jfr.lock-threshold-ms    (long, default 5)
+ *       - minimum jdk.JavaMonitorWait / JavaMonitorEnter duration recorded
+ *   otel.instrumentation.jfr.jit-threshold-ms     (long, default 100)
+ *       - minimum jdk.Compilation duration recorded
+ *   otel.instrumentation.jfr.system-properties    (boolean, default false)
+ *       - log initial system properties once (secret-looking keys redacted)
+ *   otel.instrumentation.jfr.stack-summary        (boolean, default true)
+ *       - also aggregate samples into folded-stack log records (flame-graph
+ *         input) plus a jfr.jvm.execution_sample.count leaf-method counter,
+ *         flushed every profile.flush-interval-ms
  * </pre>
  *
  * <p>When {@code profile=true}, profiles are POSTed to (in precedence order):
@@ -53,6 +67,13 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
   static final String PROP_PROFILE = "otel.instrumentation.jfr.profile";
   static final String PROP_FLUSH_INTERVAL_MS = "otel.instrumentation.jfr.profile.flush-interval-ms";
   static final String PROP_STACK_LOG = "otel.instrumentation.jfr.stack-log";
+  static final String PROP_NATIVE_SAMPLES = "otel.instrumentation.jfr.native-samples";
+  static final String PROP_THREAD_NAME_NORMALIZE =
+      "otel.instrumentation.jfr.thread-name-normalize";
+  static final String PROP_LOCK_THRESHOLD_MS = "otel.instrumentation.jfr.lock-threshold-ms";
+  static final String PROP_JIT_THRESHOLD_MS = "otel.instrumentation.jfr.jit-threshold-ms";
+  static final String PROP_SYSTEM_PROPERTIES = "otel.instrumentation.jfr.system-properties";
+  static final String PROP_STACK_SUMMARY = "otel.instrumentation.jfr.stack-summary";
 
   static final String PROP_OTLP_ENDPOINT = "otel.exporter.otlp.endpoint";
   static final String PROP_OTLP_PROFILES_ENDPOINT = "otel.exporter.otlp.profiles.endpoint";
@@ -91,6 +112,13 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
     final boolean perThreadMetricsEnabled;
     final boolean allocationEnabled;
     final boolean socketEnabled;
+    // sampling, threshold and logging knobs
+    final boolean nativeSampleEnabled;
+    final boolean normalizeThreadNames;
+    final long lockThresholdMs;
+    final long jitThresholdMs;
+    final boolean systemPropertiesEnabled;
+    final boolean stackSummaryEnabled;
 
     JfrSettings(
         boolean executionSampleEnabled,
@@ -104,7 +132,13 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
         long metricsPeriodMs,
         boolean perThreadMetricsEnabled,
         boolean allocationEnabled,
-        boolean socketEnabled) {
+        boolean socketEnabled,
+        boolean nativeSampleEnabled,
+        boolean normalizeThreadNames,
+        long lockThresholdMs,
+        long jitThresholdMs,
+        boolean systemPropertiesEnabled,
+        boolean stackSummaryEnabled) {
       this.executionSampleEnabled = executionSampleEnabled;
       this.samplingPeriodMs = samplingPeriodMs;
       this.profileMode = profileMode;
@@ -117,6 +151,12 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
       this.perThreadMetricsEnabled = perThreadMetricsEnabled;
       this.allocationEnabled = allocationEnabled;
       this.socketEnabled = socketEnabled;
+      this.nativeSampleEnabled = nativeSampleEnabled;
+      this.normalizeThreadNames = normalizeThreadNames;
+      this.lockThresholdMs = lockThresholdMs;
+      this.jitThresholdMs = jitThresholdMs;
+      this.systemPropertiesEnabled = systemPropertiesEnabled;
+      this.stackSummaryEnabled = stackSummaryEnabled;
     }
   }
 
@@ -133,15 +173,16 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
    * per-thread metrics    on       on        off     off
    * allocation events     on       off       off     off   (highest-volume family)
    * socket read events    on       on        off     off
+   * native samples        on       off       off     off
    * execution samples     on       on        on      off
    * sampling period (ms)   10       20        50       -
    * </pre>
    */
   enum Level {
-    FULL(true, 1000L, true, true, true, true, 10L),
-    STANDARD(true, 2000L, true, false, true, true, 20L),
-    LIGHT(true, 5000L, false, false, false, true, 50L),
-    OFF(false, 0L, false, false, false, false, 0L);
+    FULL(true, 1000L, true, true, true, true, 10L, true),
+    STANDARD(true, 2000L, true, false, true, true, 20L, false),
+    LIGHT(true, 5000L, false, false, false, true, 50L, false),
+    OFF(false, 0L, false, false, false, false, 0L, false);
 
     final boolean metricsEnabled;
     final long metricsPeriodMs;
@@ -150,6 +191,7 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
     final boolean socketEnabled;
     final boolean executionSampleEnabled;
     final long samplingPeriodMs;
+    final boolean nativeSampleEnabled;
 
     Level(
         boolean metricsEnabled,
@@ -158,7 +200,8 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
         boolean allocationEnabled,
         boolean socketEnabled,
         boolean executionSampleEnabled,
-        long samplingPeriodMs) {
+        long samplingPeriodMs,
+        boolean nativeSampleEnabled) {
       this.metricsEnabled = metricsEnabled;
       this.metricsPeriodMs = metricsPeriodMs;
       this.perThreadMetricsEnabled = perThreadMetricsEnabled;
@@ -166,6 +209,7 @@ public class JfrExtensionProvider implements AutoConfigurationCustomizerProvider
       this.socketEnabled = socketEnabled;
       this.executionSampleEnabled = executionSampleEnabled;
       this.samplingPeriodMs = samplingPeriodMs;
+      this.nativeSampleEnabled = nativeSampleEnabled;
     }
 
     static Level fromString(String s) {
